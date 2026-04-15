@@ -285,7 +285,10 @@ local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag)
     if n_flag then
         local suffix, new_off = read_z16_string(tvb, offset)
         if #suffix > 0 then
-            we_tree:add(pf.key_suffix, tvb(offset, new_off - offset), suffix)
+            local avail = math.min(new_off - offset, tvb:len() - offset)
+            if avail > 0 then
+                we_tree:add(pf.key_suffix, tvb(offset, avail), suffix)
+            end
         end
         offset = new_off
     end
@@ -646,8 +649,9 @@ local function parse_oam_body(tvb, tree, offset, hdr)
                 body_tree:add(zenoh_proto, tvb(offset, raw),
                     string.format("OAM Payload [%d bytes, raw]", raw))
             end
-            offset = body_end
         end
+        -- Always advance past the full OAM body regardless of decoding path
+        offset = body_end
     end
     -- enc == 0 (Unit) and enc == 3 (Reserved): no body bytes
     return offset
