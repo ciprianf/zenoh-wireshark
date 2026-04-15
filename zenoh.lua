@@ -600,18 +600,137 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
     return offset
 end
 
+-- Decode a LinkStateList from tvb[offset..body_end).
+-- Wire format (from zenoh-rust linkstate codec):
+--   VLE count
+--   per entry: VLE options | VLE psid | VLE sn
+--              | [u8 zid_len + bytes  if PID(0x01)]
+--              | [u8 whatami          if WAI(0x02)]
+--              | [VLE loc_count + (u8 str_len + bytes)* if LOC(0x04)]
+--              | VLE links_count + VLE link_id*
+--              | [u16le weight*       if WGT(0x08)]
+local function parse_link_state_list(tvb, tree, offset, body_end)
+    local count, clen = read_vle(tvb, offset)
+    if offset + clen > body_end then return offset end
+    tree:add(zenoh_proto, tvb(offset, clen),
+        string.format("LinkStateList count: %d", count))
+    offset = offset + clen
+
+    for i = 1, count do
+        if offset >= body_end then break end
+        local ls_start = offset
+        local ls_tree  = tree:add(zenoh_proto, tvb(offset, 0),
+            string.format("LinkState [%d]", i - 1))
+
+        local opts, olen = read_vle(tvb, offset)
+        if offset + olen > body_end then ls_tree:set_len(1); break end
+        ls_tree:add(zenoh_proto, tvb(offset, olen),
+            string.format("Options: 0x%02x (PID=%d WAI=%d LOC=%d WGT=%d GWY=%d)",
+                opts,
+                opts % 2,
+                math.floor(opts / 2) % 2,
+                math.floor(opts / 4) % 2,
+                math.floor(opts / 8) % 2,
+                math.floor(opts / 16) % 2))
+        offset = offset + olen
+
+        local psid, plen = read_vle(tvb, offset)
+        if offset + plen > body_end then ls_tree:set_len(offset - ls_start); break end
+        ls_tree:add(zenoh_proto, tvb(offset, plen), string.format("PSID: %d", psid))
+        offset = offset + plen
+
+        local sn, snlen = read_vle(tvb, offset)
+        if offset + snlen > body_end then ls_tree:set_len(offset - ls_start); break end
+        ls_tree:add(zenoh_proto, tvb(offset, snlen), string.format("SN: %d", sn))
+        offset = offset + snlen
+
+        -- ZenohID: u8 length + bytes  (PID flag = bit 0)
+        if (opts % 2 == 1) and offset < body_end then
+            local zid_len   = safe_byte(tvb, offset)
+            local zid_start = offset
+            offset = offset + 1
+            if offset + zid_len <= body_end then
+                ls_tree:add(pf.zid, tvb(zid_start, 1 + zid_len))
+                offset = offset + zid_len
+            end
+        end
+
+        -- WhatAmI: u8  (WAI flag = bit 1)
+        if (math.floor(opts / 2) % 2 == 1) and offset < body_end then
+            local wai = safe_byte(tvb, offset)
+            ls_tree:add(zenoh_proto, tvb(offset, 1),
+                string.format("WhatAmI: %s", lookup(vs_wai, wai)))
+            offset = offset + 1
+        end
+
+        -- Locators: VLE count + (u8 str_len + bytes)*  (LOC flag = bit 2)
+        if (math.floor(opts / 4) % 2 == 1) and offset < body_end then
+            local lcount, lclen = read_vle(tvb, offset)
+            if offset + lclen <= body_end then
+                ls_tree:add(zenoh_proto, tvb(offset, lclen),
+                    string.format("Locator count: %d", lcount))
+                offset = offset + lclen
+                for j = 1, lcount do
+                    if offset >= body_end then break end
+                    local slen      = safe_byte(tvb, offset)
+                    local loc_start = offset
+                    offset = offset + 1
+                    local avail = math.min(slen, body_end - offset)
+                    if avail > 0 then
+                        ls_tree:add(pf.locator, tvb(loc_start, 1 + avail),
+                            tvb(offset, avail):string())
+                    end
+                    offset = offset + slen
+                end
+            end
+        end
+
+        -- Links: VLE count + VLE link_id*
+        local llinks, lllen = read_vle(tvb, offset)
+        if offset + lllen <= body_end then
+            ls_tree:add(zenoh_proto, tvb(offset, lllen),
+                string.format("Links count: %d", llinks))
+            offset = offset + lllen
+            for k = 1, llinks do
+                if offset >= body_end then break end
+                local lid, lilen = read_vle(tvb, offset)
+                ls_tree:add(zenoh_proto, tvb(offset, lilen),
+                    string.format("Link: %d", lid))
+                offset = offset + lilen
+            end
+
+            -- Weights: u16le per link  (WGT flag = bit 3)
+            if (math.floor(opts / 8) % 2 == 1) then
+                for k = 1, llinks do
+                    if offset + 2 > body_end then break end
+                    ls_tree:add(zenoh_proto, tvb(offset, 2),
+                        string.format("Link weight: %d", tvb(offset, 2):le_uint()))
+                    offset = offset + 2
+                end
+            end
+        end
+
+        ls_tree:set_len(offset - ls_start)
+    end
+    return offset
+end
+
 -- Parse an OAM body based on ENC bits (bits 6:5 of the OAM header).
 -- ENC=0 (Unit): no body.  ENC=1 (Z64): VLE u64.
--- ENC=2 (ZBuf): VLE-len + bytes decoded as a sequence of Zenoh z-strings.
+-- ENC=2 (ZBuf): VLE-len + bytes decoded as a LinkStateList.
 local function parse_oam_body(tvb, tree, offset, hdr)
-    local enc = math.floor(hdr / 32) % 4   -- bits 6:5
-    if enc == 1 then                        -- Z64: VLE u64 value
+    -- ENC is in bit 6 (ZBuf) and bit 5 (Z64), but bit 5 doubles as the T flag in
+    -- network OAM headers — check each bit independently so 0x7f is read as ZBuf.
+    local enc_zbuf = (math.floor(hdr / 64) % 2 == 1)           -- bit 6
+    local enc_z64  = (not enc_zbuf) and (math.floor(hdr / 32) % 2 == 1)  -- bit 5, bit 6 clear
+
+    if enc_z64 then                         -- Z64: VLE u64 value
         local val, vlen = read_vle(tvb, offset)
         tree:add(zenoh_proto, tvb(offset, vlen),
             string.format("OAM Z64 Value: %d", val))
         offset = offset + vlen
 
-    elseif enc == 2 then                    -- ZBuf: sequence of Zenoh strings
+    elseif enc_zbuf then                    -- ZBuf: LinkStateList
         local blen, bvlen = read_vle(tvb, offset)
         local body_start  = offset
         local body_end    = math.min(offset + bvlen + blen, tvb:len())
@@ -619,41 +738,13 @@ local function parse_oam_body(tvb, tree, offset, hdr)
             string.format("OAM Body [%d bytes]", blen))
         offset = offset + bvlen
 
-        -- Try decoding as: VLE count  +  count × (VLE length + UTF-8 string)
-        local decoded = false
         if offset < body_end then
-            local count, clen = read_vle(tvb, offset)
-            if count >= 0 and count <= 256 and offset + clen <= body_end then
-                body_tree:add(zenoh_proto, tvb(offset, clen),
-                    string.format("Count: %d", count))
-                offset = offset + clen
-                decoded = true
-                for i = 1, count do
-                    if offset >= body_end then break end
-                    local slen, svlen = read_vle(tvb, offset)
-                    local item_start  = offset
-                    offset = offset + svlen
-                    local avail = math.min(slen, body_end - offset)
-                    if avail > 0 then
-                        local s = tvb(offset, avail):string()
-                        body_tree:add(pf.locator, tvb(item_start, svlen + avail), s)
-                    end
-                    offset = offset + slen
-                end
-            end
-        end
-        if not decoded then
-            -- Fall back: show raw bytes
-            local raw = body_end - offset
-            if raw > 0 then
-                body_tree:add(zenoh_proto, tvb(offset, raw),
-                    string.format("OAM Payload [%d bytes, raw]", raw))
-            end
+            offset = parse_link_state_list(tvb, body_tree, offset, body_end)
         end
         -- Always advance past the full OAM body regardless of decoding path
         offset = body_end
     end
-    -- enc == 0 (Unit) and enc == 3 (Reserved): no body bytes
+    -- Unit (bits 6:5 = 00) and Reserved (bits 6:5 = 11): no body bytes
     return offset
 end
 
@@ -791,6 +882,10 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         offset = add_vle(nm_tree, pf.oam_id, tvb, offset)
         if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
         offset = parse_oam_body(tvb, nm_tree, offset, hdr)
+
+    else
+        -- Unknown network message: consume extensions to maintain stream alignment.
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
     end
 
     nm_tree:set_len(offset - nm_start)
