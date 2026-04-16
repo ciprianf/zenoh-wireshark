@@ -212,14 +212,77 @@ pf.oam_id              = ProtoField.uint32("zenoh.oam_id", "OAM ID", base.DEC)
 pf.interest_options    = ProtoField.uint8("zenoh.interest_options", "Options Byte", base.HEX)
 pf.interest_mod        = ProtoField.uint8("zenoh.interest_mod", "Mode", base.HEX)
 
+-- Session ZID (propagated from INIT/JOIN/HELLO to every subsequent packet)
+pf.session_src_zid     = ProtoField.bytes("zenoh.session.src_zid", "Session Source ZID")
+pf.session_dst_zid     = ProtoField.bytes("zenoh.session.dst_zid", "Session Dest ZID")
+-- Network-layer message ID (distinct from transport-layer zenoh.msg_id)
+pf.net_msg_id          = ProtoField.uint8("zenoh.net.msg_id", "Network Message ID",
+                             base.HEX, vs_network_id)
+-- Fully resolved key expression (scope looked up from D_KEYEXPR declarations)
+pf.keyexpr             = ProtoField.string("zenoh.keyexpr", "Key Expression (resolved)")
+
 -- Assign all fields to the protocol
 for _, v in pairs(pf) do
     F[#F + 1] = v
 end
 
 -- ──────────────────────────────────────────────────────────────
+-- 3.5  Cross-packet state
+-- ──────────────────────────────────────────────────────────────
+
+-- ZID table: stream_zid_table[stream_key] = { src = ByteArray, dst = ByteArray }
+-- Populated by INIT/JOIN/SCOUT/HELLO parsers on the first dissection pass.
+local stream_zid_table     = {}
+-- Key expression table: keyexpr_table[stream_key][expr_id] = "full/key/expression"
+-- Populated when a D_KEYEXPR declaration is parsed.
+local keyexpr_table        = {}
+-- Per-packet ZID snapshot — stable across Wireshark's multiple re-dissection passes.
+local packet_zid_cache     = {}
+-- Per-packet resolved key expression cache.
+local packet_keyexpr_cache = {}
+
+-- Field extractor for tcp.stream.  Field.new MUST be called at the script top level
+-- (i.e. during plugin load), not inside any function — Wireshark registers extractors
+-- at load time.  The actual value is retrieved by calling f_tcp_stream() at dissect time.
+local f_tcp_stream = Field.new("tcp.stream")
+
+-- ──────────────────────────────────────────────────────────────
 -- 4.  Helper functions
 -- ──────────────────────────────────────────────────────────────
+
+-- Return a stable string key for the current packet's stream/session.
+-- TCP: uses the tcp.stream integer index from the field extractor.
+-- UDP: constructs a sorted 4-tuple so A→B and B→A share the same key.
+local function get_stream_key(pinfo)
+    local tcp_fi = f_tcp_stream()
+    if tcp_fi then
+        return "tcp:" .. tostring(tcp_fi.value)
+    end
+    -- UDP fallback
+    local s1 = tostring(pinfo.src)  .. ":" .. tostring(pinfo.src_port)
+    local s2 = tostring(pinfo.dst)  .. ":" .. tostring(pinfo.dst_port)
+    if s1 > s2 then s1, s2 = s2, s1 end
+    return "udp:" .. s1 .. "-" .. s2
+end
+
+-- Record the ZID bytes seen in INIT / JOIN / SCOUT / HELLO into the stream table.
+-- Only writes on the first dissection pass (pinfo.visited == false).
+-- The first distinct ZID on a stream is "src"; the second distinct one is "dst".
+local function record_peer_zid(pinfo, tvb, offset, zid_bytes)
+    if pinfo.visited then return end
+    local key = get_stream_key(pinfo)
+    if not stream_zid_table[key] then stream_zid_table[key] = {} end
+    local entry = stream_zid_table[key]
+    local ba = tvb(offset, zid_bytes):bytes()
+    if not entry.src then
+        entry.src = ba
+    elseif not entry.dst then
+        -- Only store as dst if genuinely different from src
+        if tostring(ba) ~= tostring(entry.src) then
+            entry.dst = ba
+        end
+    end
+end
 
 -- Read a variable-length encoded (LEB128) integer from tvb at offset.
 -- Returns (value, bytes_consumed).  Handles up to 9 bytes (z64).
@@ -280,13 +343,16 @@ end
 -- Parse WireExpr into a tree node. Returns new offset.
 -- n_flag: suffix present; m_flag: mapping (1=sender, 0=receiver)
 local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag)
-    local we_tree = tree:add(zenoh_proto, tvb(offset, 0), "WireExpr")
+    local we_start = offset
+    local we_tree  = tree:add(zenoh_proto, tvb(offset, 0), "WireExpr")
     local scope_val, slen = read_vle(tvb, offset)
     we_tree:add(pf.key_scope, tvb(offset, slen), scope_val)
     offset = offset + slen
 
+    local suffix = ""
     if n_flag then
-        local suffix, new_off = read_z16_string(tvb, offset)
+        local new_off
+        suffix, new_off = read_z16_string(tvb, offset)
         if #suffix > 0 then
             local avail = math.min(new_off - offset, tvb:len() - offset)
             if avail > 0 then
@@ -296,8 +362,40 @@ local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag)
         offset = new_off
     end
 
+    -- Resolve the full key expression from declarations seen earlier on this stream.
+    -- scope==0: suffix is the absolute key.
+    -- scope!=0: look up the declared base expression and append suffix.
+    local resolved = nil
+    if scope_val == 0 and #suffix > 0 then
+        resolved = suffix
+    elseif scope_val ~= 0 then
+        local sk    = get_stream_key(pinfo)
+        local tbl   = keyexpr_table[sk]
+        local base  = tbl and tbl[scope_val]
+        if base then
+            -- The wire suffix already contains the leading separator when present;
+            -- do not add an extra "/" between base and suffix.
+            resolved = (#suffix > 0) and (base .. suffix) or base
+        end
+    end
+    if resolved then
+        -- Cache the result for stability across Wireshark's re-dissection passes.
+        if not pinfo.visited then
+            if not packet_keyexpr_cache[pinfo.number] then
+                packet_keyexpr_cache[pinfo.number] = {}
+            end
+            packet_keyexpr_cache[pinfo.number][scope_val] = resolved
+        else
+            local c = packet_keyexpr_cache[pinfo.number]
+            if c and c[scope_val] then resolved = c[scope_val] end
+        end
+        we_tree:add(pf.keyexpr, tvb(we_start, offset - we_start), resolved)
+        we_tree:append_text(string.format(" [key=%s]", resolved))
+    end
+
     local mapping = m_flag and "sender" or "receiver"
     we_tree:append_text(string.format(" scope=%d mapping=%s", scope_val, mapping))
+    we_tree:set_len(offset - we_start)
     return offset
 end
 
@@ -545,6 +643,32 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local eid_val, eid_len = read_vle(tvb, offset)
         d_tree:add(pf.expr_id, tvb(offset, eid_len), eid_val)
         offset = offset + eid_len
+
+        -- Peek at the WireExpr to store the key expression in the lookup table.
+        -- Only on first pass to avoid redundant work.
+        if flag_n and not pinfo.visited then
+            local scope_v, sl   = read_vle(tvb, offset)
+            local decl_suffix, _ = read_z16_string(tvb, offset + sl)
+            if #decl_suffix > 0 then
+                local sk = get_stream_key(pinfo)
+                if not keyexpr_table[sk] then keyexpr_table[sk] = {} end
+                -- If scope_v == 0, decl_suffix is the full absolute key expression.
+                -- If scope_v != 0, store the suffix fragment; parse_wire_expr will
+                -- compose it with the base when the scope is resolved.
+                if scope_v == 0 then
+                    keyexpr_table[sk][eid_val] = decl_suffix
+                else
+                    local tbl  = keyexpr_table[sk]
+                    local base = tbl and tbl[scope_v]
+                    if base then
+                        keyexpr_table[sk][eid_val] = base .. decl_suffix
+                    else
+                        keyexpr_table[sk][eid_val] = decl_suffix
+                    end
+                end
+            end
+        end
+
         offset = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, false)
         if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
@@ -818,6 +942,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
     hdr_tree:add(pf.flag_fl2, tvb(offset, 1))
     hdr_tree:add(pf.flag_fl1, tvb(offset, 1))
     hdr_tree:add(pf.msg_id, tvb(offset, 1), msg_id)
+    hdr_tree:add(pf.net_msg_id, tvb(offset, 1), msg_id) -- dedicated network-layer filter
     offset = offset + 1
 
     -- ── PUSH (0x1D) ──────────────────────────────────────────
@@ -970,6 +1095,7 @@ local function dissect_init(tvb, pinfo, tree, offset, hdr)
     -- ZID
     if offset + zid_bytes <= tvb:len() then
         tree:add(pf.zid, tvb(offset, zid_bytes))
+        record_peer_zid(pinfo, tvb, offset, zid_bytes)
         offset = offset + zid_bytes
     end
 
@@ -1072,6 +1198,7 @@ local function dissect_join(tvb, pinfo, tree, offset, hdr)
     -- ZID
     if offset + zid_bytes <= tvb:len() then
         tree:add(pf.zid, tvb(offset, zid_bytes))
+        record_peer_zid(pinfo, tvb, offset, zid_bytes)
         offset = offset + zid_bytes
     end
 
@@ -1238,6 +1365,7 @@ local function dissect_scout(tvb, pinfo, tree, offset, hdr)
 
     if has_id and offset + zid_bytes <= tvb:len() then
         tree:add(pf.zid, tvb(offset, zid_bytes))
+        record_peer_zid(pinfo, tvb, offset, zid_bytes)
         offset = offset + zid_bytes
     end
 
@@ -1267,6 +1395,7 @@ local function dissect_hello(tvb, pinfo, tree, offset, hdr)
 
     if offset + zid_bytes <= tvb:len() then
         tree:add(pf.zid, tvb(offset, zid_bytes))
+        record_peer_zid(pinfo, tvb, offset, zid_bytes)
         offset = offset + zid_bytes
     end
 
@@ -1312,6 +1441,23 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
     -- hidden automatically in Wireshark >= 4.2 but visible in older builds.
     -- There is no Lua API to suppress it — it is a framework artifact.
     local root = tree:add(zenoh_proto, tvb(), "Zenoh Protocol")
+
+    -- Inject session ZID virtual fields onto every packet of the stream.
+    -- ZIDs are recorded when INIT/JOIN/SCOUT/HELLO messages are parsed.
+    do
+        local sk     = get_stream_key(pinfo)
+        local zentry = stream_zid_table[sk]
+        if zentry then
+            if not pinfo.visited then
+                packet_zid_cache[pinfo.number] = { src = zentry.src, dst = zentry.dst }
+            end
+            local zc = packet_zid_cache[pinfo.number]
+            if zc then
+                if zc.src then root:add(pf.session_src_zid, zc.src:tvb("src_zid")(0)) end
+                if zc.dst then root:add(pf.session_dst_zid, zc.dst:tvb("dst_zid")(0)) end
+            end
+        end
+    end
 
     -- ── Scouting (UDP 7446) ──────────────────────────────────
     if is_scouting and not is_tcp then
@@ -1400,3 +1546,40 @@ DissectorTable.get("udp.port"):add(7446, zenoh_proto)
 -- Also handle the IANA-registered port 7447 on any variant
 -- Some implementations use different scouting ports
 DissectorTable.get("udp.port"):add(7448, zenoh_proto)
+
+-- ──────────────────────────────────────────────────────────────
+-- 13.  Heuristic dissection (non-standard ports)
+-- ──────────────────────────────────────────────────────────────
+-- These heuristics fire only on ports not already claimed by section 12.
+-- Once a packet is accepted, pinfo.conversation = zenoh_proto locks all
+-- subsequent packets on that TCP connection / UDP 4-tuple to this dissector.
+
+local function zenoh_heuristic_tcp(tvb, pinfo, tree)
+    -- Minimum: 2-byte LE frame-length prefix + 1-byte message header
+    if tvb:len() < 3 then return false end
+    local frame_len = tvb(0, 2):le_uint()
+    -- frame_len == 0 is meaningless; > 65535 is implausible
+    if frame_len == 0 or frame_len > 65535 then return false end
+    local hdr    = tvb(2, 1):uint()
+    local msg_id = hdr % 32   -- bits 4:0
+    -- Valid transport IDs: 0x01–0x07 (exclude 0x00 / OAM — too ambiguous)
+    if msg_id == 0 or msg_id > 0x07 then return false end
+    zenoh_proto.dissector(tvb, pinfo, tree)
+    pinfo.conversation = zenoh_proto
+    return true
+end
+
+local function zenoh_heuristic_udp(tvb, pinfo, tree)
+    -- Minimum: 1-byte message header
+    if tvb:len() < 1 then return false end
+    local hdr    = tvb(0, 1):uint()
+    local msg_id = hdr % 32
+    -- Valid transport IDs: 0x01–0x07
+    if msg_id == 0 or msg_id > 0x07 then return false end
+    zenoh_proto.dissector(tvb, pinfo, tree)
+    pinfo.conversation = zenoh_proto
+    return true
+end
+
+zenoh_proto:register_heuristic("tcp", zenoh_heuristic_tcp)
+zenoh_proto:register_heuristic("udp", zenoh_heuristic_udp)
