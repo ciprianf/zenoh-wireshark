@@ -70,6 +70,12 @@ To verify from the command line (after installation):
 tshark -r <capture.pcapng> -Y zenoh -V
 ```
 
+For a repo-local regression check against the bundled captures:
+
+```sh
+bash tests/regression.sh
+```
+
 ## Coexistence with the native Zenoh dissector
 
 The plugin uses the display name **Zenoh Protocol (Lua)**, so it coexists
@@ -87,12 +93,15 @@ plugin. Both can be loaded at the same time.
 
 ## Heuristic dissection
 
-The dissector registers TCP and UDP heuristics, so it automatically recognises
-Zenoh traffic on **non-standard ports** without any manual "Decode As" step.
-The heuristic validates the 2-byte little-endian frame-length prefix (TCP) and
-checks that the first message byte carries a valid transport message ID.  Once
-a session is recognised the dissector is locked to that TCP connection or UDP
-4-tuple for all subsequent packets.
+The dissector registers TCP and UDP heuristics for **transport traffic** on
+non-standard ports. The TCP heuristic validates the 2-byte little-endian
+frame-length prefix, while the UDP heuristic checks that the first message byte
+looks like a valid transport message ID (`0x01`-`0x07`). Once a session is
+recognised the dissector is locked to that TCP connection or UDP 4-tuple for
+all subsequent packets.
+
+UDP scouting traffic is still identified by its registered port (`7446`) rather
+than by the generic UDP heuristic.
 
 ## Display filters
 
