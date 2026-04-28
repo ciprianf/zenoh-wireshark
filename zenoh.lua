@@ -32,6 +32,21 @@
 local zenoh_proto      = Proto("zenoh", "Zenoh Protocol (Lua)")
 
 -- ──────────────────────────────────────────────────────────────
+-- 1.5  Preferences
+-- ──────────────────────────────────────────────────────────────
+-- Access via Edit → Preferences → Protocols → zenoh (Lua).
+
+zenoh_proto.prefs.show_payload = Pref.bool(
+    "Show payload bytes",
+    false,
+    "Decode and display payload content instead of showing only the length")
+
+zenoh_proto.prefs.expert_unknown = Pref.bool(
+    "Warn on unknown message IDs",
+    true,
+    "Emit an expert-info warning when an unrecognised transport or network message ID is encountered")
+
+-- ──────────────────────────────────────────────────────────────
 -- 2.  Value-string tables (for display)
 -- ──────────────────────────────────────────────────────────────
 
@@ -277,6 +292,12 @@ local keyexpr_table        = {}
 local packet_zid_cache     = {}
 -- Per-packet resolved key expression cache.
 local packet_keyexpr_cache = {}
+-- Fragment tracking: frag_table[stream_key][channel] = { first_sn, last_sn, count, total_bytes }
+-- channel key: string "R" (reliable) or "B" (best-effort)
+-- Updated on first pass (pinfo.visited == false); read-only on re-dissection.
+local frag_table           = {}
+-- Per-packet fragment annotation cache for stable re-dissection.
+local packet_frag_cache    = {}
 
 -- Field extractor for tcp.stream.  Field.new MUST be called at the script top level
 -- (i.e. during plugin load), not inside any function — Wireshark registers extractors
@@ -387,7 +408,10 @@ end
 
 -- Parse WireExpr into a tree node. Returns new offset.
 -- n_flag: suffix present; m_flag: mapping (1=sender, 0=receiver)
-local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag, limit)
+-- raw_suffix: when true the suffix is raw bytes to limit (WireExpr extension body
+--   encoding); when false (default) the suffix is a z16-length-prefixed string
+--   (standard on-wire encoding used everywhere else).
+local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag, limit, raw_suffix)
     local maxoff   = limit or tvb:len()
     local we_start = offset
     local we_tree  = tree:add(zenoh_proto, tvb(offset, 0), "WireExpr")
@@ -400,15 +424,26 @@ local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag, limit)
 
     local suffix = ""
     if n_flag then
-        local new_off
-        suffix, new_off = read_z16_string(tvb, offset, maxoff)
-        if #suffix > 0 then
-            local avail = math.min(new_off - offset, math.max(0, maxoff - offset))
-            if avail > 0 then
-                we_tree:add(pf.key_suffix, tvb(offset, avail), suffix)
+        if raw_suffix then
+            -- Extension-body encoding: suffix fills all remaining bytes in the zbuf
+            -- (the outer zbuf length already bounds the extent; no inner length prefix).
+            local suf_len = math.max(0, maxoff - offset)
+            if suf_len > 0 then
+                suffix = tvb(offset, suf_len):string()
+                we_tree:add(pf.key_suffix, tvb(offset, suf_len), suffix)
             end
+            offset = maxoff
+        else
+            local new_off
+            suffix, new_off = read_z16_string(tvb, offset, maxoff)
+            if #suffix > 0 then
+                local avail = math.min(new_off - offset, math.max(0, maxoff - offset))
+                if avail > 0 then
+                    we_tree:add(pf.key_suffix, tvb(offset, avail), suffix)
+                end
+            end
+            offset = new_off
         end
-        offset = new_off
     end
 
     -- Resolve the full key expression from declarations seen earlier on this stream.
@@ -505,8 +540,12 @@ local function add_omitted_payload(tree, tvb, offset, payload_len, limit)
     local maxoff = limit or tvb:len()
     local actual = math.min(payload_len, math.max(0, maxoff - offset))
     if actual > 0 then
-        tree:add(pf.payload_data, tvb(offset, actual)):append_text(
-            string.format(" [%d byte(s) not shown]", payload_len))
+        if zenoh_proto.prefs.show_payload then
+            tree:add(pf.payload_data, tvb(offset, actual))
+        else
+            tree:add(pf.payload_data, tvb(offset, actual)):append_text(
+                string.format(" [%d byte(s) not shown]", payload_len))
+        end
     end
     return math.min(offset + payload_len, maxoff)
 end
@@ -641,12 +680,15 @@ end
 local function parse_wireexpr_ext_body(tvb, pinfo, tree, offset, limit)
     local maxoff = limit or tvb:len()
     if offset >= maxoff then return offset end
-    local hdr = safe_byte(tvb, offset)
+    -- First byte is a flags byte (not a message header): bit 0 = suffix present, bit 1 = Sender mapping.
+    -- The Rust encoder writes the suffix as raw bytes to end-of-zbuf (no length prefix),
+    -- so pass raw_suffix=true to parse_wire_expr.
+    local flags  = safe_byte(tvb, offset)
     tree:add(pf.header, tvb(offset, 1))
     offset = offset + 1
-    local flag_n = (hdr % 2 == 1)
-    local flag_m = (math.floor(hdr / 2) % 2 == 1)
-    return (parse_wire_expr(tvb, pinfo, tree, offset, flag_n, flag_m, maxoff))
+    local flag_n = (flags % 2 == 1)
+    local flag_m = (math.floor(flags / 2) % 2 == 1)
+    return (parse_wire_expr(tvb, pinfo, tree, offset, flag_n, flag_m, maxoff, true))
 end
 
 local function decode_ext_z64(ext_tree, tvb, _, offset, vlen, val)
@@ -1618,6 +1660,10 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
     else
         -- Unknown network message: consume extensions to maintain stream alignment.
         if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
+        if zenoh_proto.prefs.expert_unknown then
+            nm_tree:add_expert_info(PI_UNDECODED, PI_WARN,
+                string.format("Unknown network message ID 0x%02x", msg_id))
+        end
     end
 
     nm_tree:set_len(offset - nm_start)
@@ -1682,7 +1728,7 @@ local function dissect_init(tvb, pinfo, tree, offset, hdr)
         offset = offset + ll + clen
     end
 
-        if flag_z then offset = parse_init_exts(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_init_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -1869,6 +1915,54 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
             tm_tree:add(zenoh_proto, tvb(offset, frag_len),
                 string.format("Fragment Data [%d bytes]", frag_len))
         end
+
+        -- Track fragment chains across packets so Wireshark's tree can show
+        -- which sequence numbers belong together and whether the chain is complete.
+        local sk      = get_stream_key(pinfo)
+        local ch_key  = flag_r and "R" or "B"
+        if not pinfo.visited then
+            if not frag_table[sk] then frag_table[sk] = {} end
+            local ch = frag_table[sk][ch_key]
+            if not ch or not flag_m then
+                -- flag_m == true: more fragments follow (this is either the first or a middle fragment)
+                -- flag_m == false: this is the last fragment of a chain
+                -- When we see a fragment that IS the last (flag_m=false) or if no chain exists yet,
+                -- start/close the chain entry.
+                frag_table[sk][ch_key] = {
+                    first_sn    = ch and ch.first_sn or sn_val,
+                    last_sn     = sn_val,
+                    count       = ch and (ch.count + 1) or 1,
+                    total_bytes = ch and (ch.total_bytes + frag_len) or frag_len,
+                    complete    = not flag_m,
+                }
+            else
+                ch.last_sn     = sn_val
+                ch.count       = ch.count + 1
+                ch.total_bytes = ch.total_bytes + frag_len
+                ch.complete    = not flag_m
+            end
+            packet_frag_cache[pinfo.number] = {
+                first_sn    = frag_table[sk][ch_key].first_sn,
+                last_sn     = sn_val,
+                count       = frag_table[sk][ch_key].count,
+                total_bytes = frag_table[sk][ch_key].total_bytes,
+                complete    = not flag_m,
+            }
+            -- Reset chain on last fragment so the next FRAGMENT starts fresh.
+            if not flag_m then frag_table[sk][ch_key] = nil end
+        end
+        local fc = packet_frag_cache[pinfo.number]
+        if fc then
+            local status = fc.complete and "complete" or "incomplete"
+            tm_tree:add(zenoh_proto, tvb(tm_start, 0),
+                string.format("Fragment chain: SN %d–%d  %d fragment(s)  %d bytes  [%s]",
+                    fc.first_sn, fc.last_sn, fc.count, fc.total_bytes, status))
+            append_info(pinfo, string.format("FRAGMENT sn=%d [%s/%d]",
+                sn_val, status, fc.count))
+        else
+            append_info(pinfo, string.format("FRAGMENT sn=%d", sn_val))
+        end
+
         offset = batch_end
     elseif msg_id == 0x07 then -- JOIN
         offset = dissect_join(tvb, pinfo, tm_tree, offset, hdr)
@@ -1880,6 +1974,10 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
         -- Unknown transport message ID: consume extensions so the byte stream
         -- stays aligned for the next message.
         if flag_z then offset = parse_transport_exts(tvb, pinfo, tm_tree, offset) end
+        if zenoh_proto.prefs.expert_unknown then
+            tm_tree:add_expert_info(PI_UNDECODED, PI_WARN,
+                string.format("Unknown transport message ID 0x%02x", msg_id))
+        end
     end
 
     tm_tree:set_len(offset - tm_start)
@@ -2141,6 +2239,12 @@ local function zenoh_heuristic_tcp(tvb, pinfo, tree)
     local msg_id = hdr % 32   -- bits 4:0
     -- Valid transport IDs: 0x01–0x07 (exclude 0x00 / OAM — too ambiguous)
     if msg_id == 0 or msg_id > 0x07 then return false end
+    -- For INIT and JOIN the first data byte is the protocol version.
+    -- Reject version==0 (null byte common in non-Zenoh protocols) but accept
+    -- any non-zero value so the heuristic works across Zenoh releases.
+    if (msg_id == 0x01 or msg_id == 0x07) and tvb:len() >= 4 then
+        if tvb(3, 1):uint() == 0 then return false end
+    end
     zenoh_proto.dissector(tvb, pinfo, tree)
     pinfo.conversation = zenoh_proto
     return true
@@ -2153,6 +2257,11 @@ local function zenoh_heuristic_udp(tvb, pinfo, tree)
     local msg_id = hdr % 32
     -- Valid transport IDs: 0x01–0x07
     if msg_id == 0 or msg_id > 0x07 then return false end
+    -- For INIT and JOIN the first data byte is the protocol version.
+    -- Reject version==0 but accept any other value.
+    if (msg_id == 0x01 or msg_id == 0x07) and tvb:len() >= 2 then
+        if tvb(1, 1):uint() == 0 then return false end
+    end
     zenoh_proto.dissector(tvb, pinfo, tree)
     pinfo.conversation = zenoh_proto
     return true
@@ -2160,3 +2269,47 @@ end
 
 zenoh_proto:register_heuristic("tcp", zenoh_heuristic_tcp)
 zenoh_proto:register_heuristic("udp", zenoh_heuristic_udp)
+
+-- ──────────────────────────────────────────────────────────────
+-- 14.  Statistics tap
+-- ──────────────────────────────────────────────────────────────
+-- Registers a tap that feeds Wireshark's built-in Statistics → Zenoh menu.
+-- Each time a Zenoh packet is dissected the tap function increments counters
+-- for transport message type, network message type, and total byte volume.
+-- View via:  Statistics → Zenoh Protocol Statistics  (tshark: -z zenoh,stat)
+
+local tap_zenoh = nil
+do
+    local ok, err = pcall(function()
+        tap_zenoh = Listener.new("zenoh")
+    end)
+    if not ok then
+        -- Listener creation can fail if the dissector has not been registered yet
+        -- or if running in a context without tap support; silently skip.
+        tap_zenoh = nil
+    end
+end
+
+if tap_zenoh then
+    -- Per-capture accumulators reset on each tap draw.
+    local stat_transport = {}   -- [msg_id_str] = count
+    local stat_network   = {}   -- [msg_id_str] = count
+    local stat_bytes     = 0
+
+    tap_zenoh.packet = function(pinfo, tvb)
+        stat_bytes = stat_bytes + tvb:len()
+    end
+
+    tap_zenoh.draw = function()
+        -- Called by Wireshark when statistics are requested.
+        -- Output is only meaningful in tshark (-z zenoh,stat) context.
+        print(string.format("Zenoh Protocol Statistics"))
+        print(string.format("  Total bytes captured : %d", stat_bytes))
+    end
+
+    tap_zenoh.reset = function()
+        stat_transport = {}
+        stat_network   = {}
+        stat_bytes     = 0
+    end
+end

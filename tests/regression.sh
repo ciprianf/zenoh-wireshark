@@ -77,4 +77,24 @@ run_capture \
     "Key Expression (resolved): demo/example/zenoh-rs-put" \
     "Payload (omitted):"
 
+# REQUEST / RESPONSE / RESPONSE_FINAL flow (z_queryable + z_get)
+run_capture \
+    "assets/query-reply.pcapng" \
+    "Transport: INIT (InitSyn)" \
+    "Declaration: D_QUERYABLE" \
+    "Network: REQUEST" \
+    "Request Body: QUERY" \
+    "Key Expression (resolved): demo/example/**" \
+    "Network: RESPONSE" \
+    "Response Body: REPLY" \
+    "Key Expression (resolved): demo/example/zenoh-rs-queryable" \
+    "Network: RESPONSE_FINAL" \
+    "Transport: CLOSE"
+
+# Scouting messages (SCOUT on UDP multicast)
+run_capture \
+    "assets/scout.pcapng" \
+    "Scouting: SCOUT" \
+    "WhatAmI Matcher: 0x03"
+
 echo "All regression checks passed."
