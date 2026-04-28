@@ -273,6 +273,25 @@ pf.net_msg_id          = ProtoField.uint8("zenoh.net.msg_id", "Network Message I
 -- Fully resolved key expression (scope looked up from D_KEYEXPR declarations)
 pf.keyexpr             = ProtoField.string("zenoh.keyexpr", "Key Expression (resolved)")
 
+-- Request-Response Correlation
+pf.req_response_frame   = ProtoField.framenum("zenoh.req.response_frame",  "Response In")
+pf.req_response_time_ms = ProtoField.float("zenoh.req.response_time_ms",   "Response Time (ms)")
+pf.resp_request_frame   = ProtoField.framenum("zenoh.resp.request_frame",  "Request In")
+-- SN Gap Detection
+pf.sn_gap               = ProtoField.bool("zenoh.sn.gap",      "Sequence Number Gap",  8, {"Gap","No Gap"}, 0x01)
+pf.sn_gap_size          = ProtoField.uint32("zenoh.sn.gap_size","Missing Frames Count", base.DEC)
+
+-- Declaration Lifecycle
+pf.decl_declared_frame   = ProtoField.framenum("zenoh.decl.declared_frame",   "Declared In")
+pf.decl_undeclared_frame = ProtoField.framenum("zenoh.decl.undeclared_frame",  "Undeclared In")
+pf.decl_active_ms        = ProtoField.float("zenoh.decl.active_ms",            "Active Duration (ms)")
+-- Session Summary
+pf.session_version       = ProtoField.uint8( "zenoh.session.version",    "Protocol Version",          base.HEX)
+pf.session_ke_count      = ProtoField.uint32("zenoh.session.ke_count",   "Declared Key Expressions",  base.DEC)
+pf.session_sub_count     = ProtoField.uint32("zenoh.session.sub_count",  "Active Subscribers",        base.DEC)
+pf.session_qbl_count     = ProtoField.uint32("zenoh.session.qbl_count",  "Active Queryables",         base.DEC)
+pf.session_tok_count     = ProtoField.uint32("zenoh.session.tok_count",  "Active Tokens",             base.DEC)
+
 -- Assign all fields to the protocol
 for _, v in pairs(pf) do
     F[#F + 1] = v
@@ -298,6 +317,27 @@ local packet_keyexpr_cache = {}
 local frag_table           = {}
 -- Per-packet fragment annotation cache for stable re-dissection.
 local packet_frag_cache    = {}
+
+-- Request-Response Correlation
+-- req_table[sk][rid] = { frame = N, time_s = T }
+local req_table          = {}
+-- pkt_req_resp_cache[pkt] = { resp_frame=N, delta_ms=M }   (populated from RESPONSE back-annotation)
+local pkt_req_resp_cache = {}
+-- pkt_resp_req_cache[pkt][rid] = { req_frame=N, delta_ms=M } (populated from RESPONSE/FINAL parsing)
+local pkt_resp_req_cache = {}
+-- SN Gap Detection: sn_state[sk][ch] = last_sn  (ch = "R" or "B")
+local sn_state           = {}
+-- pkt_sn_cache[pkt] = { expected=N, got=N, channel="R"|"B" }
+local pkt_sn_cache       = {}
+
+-- Declaration Lifecycle
+-- decl_state[sk][dtype][eid] = { decl_frame=N, decl_time_s=T [, undecl_frame=N, undecl_time_s=T] }
+-- dtype: "sub" | "qbl" | "tok" | "ke"
+local decl_state         = {}
+-- pkt_decl_cache[pkt] = { partner_frame=N, delta_ms=M, is_undecl=bool }
+local pkt_decl_cache     = {}
+-- Session protocol version: session_ver[sk] = version_byte
+local session_ver        = {}
 
 -- Field extractor for tcp.stream.  Field.new MUST be called at the script top level
 -- (i.e. during plugin load), not inside any function — Wireshark registers extractors
@@ -539,13 +579,32 @@ end
 local function add_omitted_payload(tree, tvb, offset, payload_len, limit)
     local maxoff = limit or tvb:len()
     local actual = math.min(payload_len, math.max(0, maxoff - offset))
-    if actual > 0 then
-        if zenoh_proto.prefs.show_payload then
-            tree:add(pf.payload_data, tvb(offset, actual))
+    if actual <= 0 then return math.min(offset + payload_len, maxoff) end
+
+    if zenoh_proto.prefs.show_payload then
+        -- Try to determine encoding from the raw bytes and render accordingly.
+        local ok, raw = pcall(function() return tvb(offset, actual):string() end)
+        if ok and raw then
+            local first = tvb(offset, 1):uint()
+            if first == 0x7B or first == 0x5B then  -- '{' or '['
+                -- Likely JSON: show as string on a single line
+                tree:add(pf.payload_data, tvb(offset, actual)):append_text(
+                    " [JSON: " .. raw:gsub("[\r\n]+", " ") .. "]")
+            elseif raw:match("^[\t\n\r\32-\126]+$") then
+                -- Printable ASCII / UTF-8 text
+                tree:add(pf.payload_data, tvb(offset, actual)):append_text(
+                    " [Text: " .. raw .. "]")
+            else
+                -- Binary: show raw bytes (default ProtoField.bytes display)
+                tree:add(pf.payload_data, tvb(offset, actual)):append_text(
+                    string.format(" [Binary: %d bytes]", actual))
+            end
         else
-            tree:add(pf.payload_data, tvb(offset, actual)):append_text(
-                string.format(" [%d byte(s) not shown]", payload_len))
+            tree:add(pf.payload_data, tvb(offset, actual))
         end
+    else
+        tree:add(pf.payload_data, tvb(offset, actual)):append_text(
+            string.format(" [%d byte(s) not shown]", payload_len))
     end
     return math.min(offset + payload_len, maxoff)
 end
@@ -852,6 +911,62 @@ local function parse_extensions(tvb, pinfo, tree, offset, spec)
     return offset
 end
 
+-- Convert a pinfo NSTime absolute timestamp to seconds (float).
+-- Handles both NSTime objects (with .secs/.nsecs fields) and plain numbers.
+local function ts_secs(ts)
+    if type(ts) == "number" then
+        return ts
+    end
+    return ts.secs + ts.nsecs * 1e-9
+end
+
+-- Record a Declare (D_*) event and optionally link it to an earlier declaration.
+-- dtype: "sub"|"qbl"|"tok"|"ke"   eid: entity/expr id   is_undecl: true for U_* messages
+local function track_decl(pinfo, tvb, dtype, eid, is_undecl, d_tree)
+    local sk = get_stream_key(pinfo)
+    if not decl_state[sk]        then decl_state[sk]        = {} end
+    if not decl_state[sk][dtype] then decl_state[sk][dtype] = {} end
+    local tbl = decl_state[sk][dtype]
+
+    if not pinfo.visited then
+        if not is_undecl then
+            tbl[eid] = { decl_frame = pinfo.number, decl_time_s = ts_secs(pinfo.abs_ts) }
+        else
+            local entry = tbl[eid]
+            if entry and not entry.undecl_frame then
+                local now_s    = ts_secs(pinfo.abs_ts)
+                local delta_ms = (now_s - entry.decl_time_s) * 1000
+                entry.undecl_frame  = pinfo.number
+                entry.undecl_time_s = now_s
+                -- Cache for the U_ packet
+                pkt_decl_cache[pinfo.number] = { partner_frame = entry.decl_frame, delta_ms = delta_ms, is_undecl = true }
+                -- Back-annotate the D_ packet
+                if not pkt_decl_cache[entry.decl_frame] then
+                    pkt_decl_cache[entry.decl_frame] = { partner_frame = pinfo.number, delta_ms = delta_ms, is_undecl = false }
+                end
+            end
+        end
+    end
+
+    -- Add cross-reference items from cache
+    local c = pkt_decl_cache[pinfo.number]
+    if c then
+        if c.is_undecl then
+            -- This is a U_ packet: show where it was declared and how long it was active
+            local fi = d_tree:add(pf.decl_declared_frame, tvb(0, 0), c.partner_frame)
+            fi:set_generated(true)
+            local ai = d_tree:add(pf.decl_active_ms, tvb(0, 0), c.delta_ms)
+            ai:set_generated(true)
+        else
+            -- This is a D_ packet: show where it was undeclared
+            local fi = d_tree:add(pf.decl_undeclared_frame, tvb(0, 0), c.partner_frame)
+            fi:set_generated(true)
+            local ai = d_tree:add(pf.decl_active_ms, tvb(0, 0), c.delta_ms)
+            ai:set_generated(true)
+        end
+    end
+end
+
 local function parse_transport_exts(tvb, pinfo, tree, offset)
     return parse_extensions(tvb, pinfo, tree, offset)
 end
@@ -1012,6 +1127,32 @@ local function parse_decl_undeclare_exts(tvb, pinfo, tree, offset)
 end
 
 -- ──────────────────────────────────────────────────────────────
+-- 4.5  Statistics accumulator (defined here so dissectors can call it)
+-- ──────────────────────────────────────────────────────────────
+
+local zenoh_stats = {
+    transport     = {},   -- [name] = count
+    network       = {},   -- [name] = count
+    scouting      = {},   -- [name] = count
+    bytes         = 0,
+    sessions      = 0,
+    resp_times_ms = {},   -- list of floats for min/avg/max
+}
+
+local function stat_count_transport(name)
+    zenoh_stats.transport[name] = (zenoh_stats.transport[name] or 0) + 1
+end
+local function stat_count_network(name)
+    zenoh_stats.network[name] = (zenoh_stats.network[name] or 0) + 1
+end
+local function stat_count_scouting(name)
+    zenoh_stats.scouting[name] = (zenoh_stats.scouting[name] or 0) + 1
+end
+local function stat_record_resp_time(delta_ms)
+    zenoh_stats.resp_times_ms[#zenoh_stats.resp_times_ms + 1] = delta_ms
+end
+
+-- ──────────────────────────────────────────────────────────────
 -- 5.  Data sub-message parsers  (PUT / DEL / QUERY / REPLY / ERR)
 -- ──────────────────────────────────────────────────────────────
 
@@ -1169,6 +1310,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
 
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, false)
+        track_decl(pinfo, tvb, "ke", eid_val, false, d_tree)
         if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
         local key_summary = summarize_keyexpr(resolved, suffix)
         if key_summary then
@@ -1182,6 +1324,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local eid_val, eid_len = read_vle(tvb, offset)
         d_tree:add(pf.expr_id, tvb(offset, eid_len), eid_val)
         offset = offset + eid_len
+        track_decl(pinfo, tvb, "ke", eid_val, true, d_tree)
         if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
         info = string.format("%s id=%d", name, eid_val)
 
@@ -1194,6 +1337,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         offset = offset + entity_len
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
+        track_decl(pinfo, tvb, "sub", entity_id, false, d_tree)
         if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
         local key_summary = summarize_keyexpr(resolved, suffix)
         if key_summary then
@@ -1207,6 +1351,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local entity_id, entity_len = read_vle(tvb, offset)
         d_tree:add(pf.entity_id, tvb(offset, entity_len), entity_id)
         offset = offset + entity_len
+        track_decl(pinfo, tvb, "sub", entity_id, true, d_tree)
         if flag_z then offset = parse_decl_undeclare_exts(tvb, pinfo, d_tree, offset) end
         info = string.format("%s entity=%d", name, entity_id)
 
@@ -1219,6 +1364,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         offset = offset + entity_len
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
+        track_decl(pinfo, tvb, "qbl", entity_id, false, d_tree)
         if flag_z then offset = parse_decl_queryable_exts(tvb, pinfo, d_tree, offset) end
         local key_summary = summarize_keyexpr(resolved, suffix)
         if key_summary then
@@ -1232,6 +1378,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local entity_id, entity_len = read_vle(tvb, offset)
         d_tree:add(pf.entity_id, tvb(offset, entity_len), entity_id)
         offset = offset + entity_len
+        track_decl(pinfo, tvb, "qbl", entity_id, true, d_tree)
         if flag_z then offset = parse_decl_undeclare_exts(tvb, pinfo, d_tree, offset) end
         info = string.format("%s entity=%d", name, entity_id)
 
@@ -1244,6 +1391,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         offset = offset + entity_len
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
+        track_decl(pinfo, tvb, "tok", entity_id, false, d_tree)
         if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
         local key_summary = summarize_keyexpr(resolved, suffix)
         if key_summary then
@@ -1257,6 +1405,7 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local entity_id, entity_len = read_vle(tvb, offset)
         d_tree:add(pf.entity_id, tvb(offset, entity_len), entity_id)
         offset = offset + entity_len
+        track_decl(pinfo, tvb, "tok", entity_id, true, d_tree)
         if flag_z then offset = parse_decl_undeclare_exts(tvb, pinfo, d_tree, offset) end
         info = string.format("%s entity=%d", name, entity_id)
 
@@ -1475,6 +1624,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
     local flag_fl2 = (hdr % 128 >= 64) -- bit 6
     local flag_z   = (hdr >= 128)      -- bit 7
     local name     = lookup(vs_network_id, msg_id)
+    if not pinfo.visited then stat_count_network(name) end
     local nm_start = offset
 
     local nm_tree  = tree:add(zenoh_proto, tvb(offset, 1),
@@ -1543,6 +1693,21 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local request_id, request_len = read_vle(tvb, offset)
         nm_tree:add(pf.request_id, tvb(offset, request_len), request_id)
         offset = offset + request_len
+        do
+            local sk = get_stream_key(pinfo)
+            if not pinfo.visited then
+                if not req_table[sk] then req_table[sk] = {} end
+                req_table[sk][request_id] = { frame = pinfo.number, time_s = ts_secs(pinfo.abs_ts) }
+            end
+            -- Show correlation on re-dissection (back-annotated by RESPONSE handler)
+            local rrc = pkt_req_resp_cache[pinfo.number]
+            if rrc then
+                local ri = nm_tree:add(pf.req_response_frame, tvb(0, 0), rrc.resp_frame)
+                ri:set_generated(true)
+                local ti = nm_tree:add(pf.req_response_time_ms, tvb(0, 0), rrc.delta_ms)
+                ti:set_generated(true)
+            end
+        end
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
         if flag_z then offset = parse_request_exts(tvb, pinfo, nm_tree, offset) end
@@ -1571,6 +1736,30 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local request_id, request_len = read_vle(tvb, offset)
         nm_tree:add(pf.request_id, tvb(offset, request_len), request_id)
         offset = offset + request_len
+        do
+            local sk = get_stream_key(pinfo)
+            if not pinfo.visited then
+                local req = req_table[sk] and req_table[sk][request_id]
+                if req then
+                    local delta_ms = (ts_secs(pinfo.abs_ts) - req.time_s) * 1000
+                    if not pkt_resp_req_cache[pinfo.number] then pkt_resp_req_cache[pinfo.number] = {} end
+                    pkt_resp_req_cache[pinfo.number][request_id] = { req_frame = req.frame, delta_ms = delta_ms }
+                    -- Back-annotate the REQUEST packet
+                    if not pkt_req_resp_cache[req.frame] then
+                        pkt_req_resp_cache[req.frame] = { resp_frame = pinfo.number, delta_ms = delta_ms }
+                    end
+                    stat_record_resp_time(delta_ms)
+                end
+            end
+            local rrc = pkt_resp_req_cache[pinfo.number]
+            local rr  = rrc and rrc[request_id]
+            if rr then
+                local ri = nm_tree:add(pf.resp_request_frame, tvb(0, 0), rr.req_frame)
+                ri:set_generated(true)
+                local ti = nm_tree:add(pf.req_response_time_ms, tvb(0, 0), rr.delta_ms)
+                ti:set_generated(true)
+            end
+        end
         local resolved, suffix
         offset, resolved, _, suffix = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
         if flag_z then offset = parse_response_exts(tvb, pinfo, nm_tree, offset) end
@@ -1602,6 +1791,30 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local request_id, request_len = read_vle(tvb, offset)
         nm_tree:add(pf.request_id, tvb(offset, request_len), request_id)
         offset = offset + request_len
+        do
+            local sk = get_stream_key(pinfo)
+            if not pinfo.visited then
+                local req = req_table[sk] and req_table[sk][request_id]
+                if req then
+                    local delta_ms = (ts_secs(pinfo.abs_ts) - req.time_s) * 1000
+                    if not pkt_resp_req_cache[pinfo.number] then pkt_resp_req_cache[pinfo.number] = {} end
+                    pkt_resp_req_cache[pinfo.number][request_id] = { req_frame = req.frame, delta_ms = delta_ms }
+                    -- Back-annotate the REQUEST packet
+                    if not pkt_req_resp_cache[req.frame] then
+                        pkt_req_resp_cache[req.frame] = { resp_frame = pinfo.number, delta_ms = delta_ms }
+                    end
+                    stat_record_resp_time(delta_ms)
+                end
+            end
+            local rrc = pkt_resp_req_cache[pinfo.number]
+            local rr  = rrc and rrc[request_id]
+            if rr then
+                local ri = nm_tree:add(pf.resp_request_frame, tvb(0, 0), rr.req_frame)
+                ri:set_generated(true)
+                local ti = nm_tree:add(pf.req_response_time_ms, tvb(0, 0), rr.delta_ms)
+                ti:set_generated(true)
+            end
+        end
         if flag_z then offset = parse_response_final_exts(tvb, pinfo, nm_tree, offset) end
         append_info(pinfo, string.format("RESPONSE_FINAL rid=%d", request_id))
 
@@ -1686,6 +1899,12 @@ local function dissect_init(tvb, pinfo, tree, offset, hdr)
     if offset >= tvb:len() then return offset end
     tree:add(pf.version, tvb(offset, 1))
     offset = offset + 1
+    do
+        local sk = get_stream_key(pinfo)
+        if not session_ver[sk] then
+            session_ver[sk] = safe_byte(tvb, offset - 1)
+        end
+    end
 
     -- packed byte: zid_len(7:4) | X | X | WhatAmI(1:0)
     if offset >= tvb:len() then return offset end
@@ -1796,6 +2015,12 @@ local function dissect_join(tvb, pinfo, tree, offset, hdr)
     if offset >= tvb:len() then return offset end
     tree:add(pf.version, tvb(offset, 1))
     offset = offset + 1
+    do
+        local sk = get_stream_key(pinfo)
+        if not session_ver[sk] then
+            session_ver[sk] = safe_byte(tvb, offset - 1)
+        end
+    end
 
     -- packed byte
     if offset >= tvb:len() then return offset end
@@ -1856,6 +2081,7 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
     local msg_id   = hdr % 32
     local flag_z   = (hdr >= 128)
     local name     = lookup(vs_transport_id, msg_id)
+    if not pinfo.visited then stat_count_transport(name) end
     local tm_start = offset
 
     local tm_tree  = batch_tree:add(zenoh_proto, tvb(offset, 1),
@@ -1884,6 +2110,31 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
         local sn_val, sn_len = read_vle(tvb, offset)
         tm_tree:add(pf.seq_num, tvb(offset, sn_len), sn_val)
         offset = offset + sn_len
+
+        -- SN gap detection: check for non-sequential SN on this channel
+        do
+            local sk = get_stream_key(pinfo)
+            local ch = flag_r and "R" or "B"
+            if not pinfo.visited then
+                if not sn_state[sk] then sn_state[sk] = {} end
+                local last = sn_state[sk][ch]
+                if last ~= nil and sn_val ~= last + 1 then
+                    pkt_sn_cache[pinfo.number] = { expected = last + 1, got = sn_val, channel = ch }
+                end
+                sn_state[sk][ch] = sn_val
+            end
+            local sc = pkt_sn_cache[pinfo.number]
+            if sc then
+                tm_tree:add_expert_info(PI_SEQUENCE, PI_WARN,
+                    string.format("SN gap on %s channel: expected %d got %d (%d missing)",
+                        sc.channel == "R" and "reliable" or "best-effort",
+                        sc.expected, sc.got, sc.got - sc.expected))
+                local gi = tm_tree:add(pf.sn_gap,      tvb(offset - sn_len, sn_len), true)
+                gi:set_generated(true)
+                local si = tm_tree:add(pf.sn_gap_size, tvb(offset - sn_len, sn_len), sc.got - sc.expected)
+                si:set_generated(true)
+            end
+        end
 
         -- optional extensions
         if flag_z then offset = parse_frame_exts(tvb, pinfo, tm_tree, offset) end
@@ -2125,6 +2376,39 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
         end
     end
 
+    -- Session summary: show protocol version + declaration state
+    do
+        local sk    = get_stream_key(pinfo)
+        local ver   = session_ver[sk]
+        local dtbl  = decl_state[sk]
+        local ke_count  = 0
+        local sub_count = 0
+        local qbl_count = 0
+        local tok_count = 0
+        if dtbl then
+            for _ in pairs(dtbl["ke"]  or {}) do ke_count  = ke_count  + 1 end
+            for _ in pairs(dtbl["sub"] or {}) do sub_count = sub_count + 1 end
+            for _ in pairs(dtbl["qbl"] or {}) do qbl_count = qbl_count + 1 end
+            for _ in pairs(dtbl["tok"] or {}) do tok_count = tok_count + 1 end
+        end
+        if ver or ke_count > 0 or sub_count > 0 or qbl_count > 0 or tok_count > 0 then
+            local ss = root:add(zenoh_proto, tvb(), "Session State")
+            ss:set_generated(true)
+            if ver then
+                local vi = ss:add(pf.session_version, tvb(0,0), ver)
+                vi:set_generated(true)
+            end
+            local ki = ss:add(pf.session_ke_count,  tvb(0,0), ke_count)
+            ki:set_generated(true)
+            local si = ss:add(pf.session_sub_count, tvb(0,0), sub_count)
+            si:set_generated(true)
+            local qi = ss:add(pf.session_qbl_count, tvb(0,0), qbl_count)
+            qi:set_generated(true)
+            local ti = ss:add(pf.session_tok_count, tvb(0,0), tok_count)
+            ti:set_generated(true)
+        end
+    end
+
     -- ── Scouting (UDP 7446) ──────────────────────────────────
     if is_scouting and not is_tcp then
         local offset = 0
@@ -2133,6 +2417,7 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
             local hdr    = safe_byte(tvb, offset)
             local msg_id = hdr % 32
             local name   = lookup(vs_scout_id, msg_id)
+            if not pinfo.visited then stat_count_scouting(name) end
             append_info(pinfo, name)
 
             local sm_start = offset
@@ -2273,43 +2558,85 @@ zenoh_proto:register_heuristic("udp", zenoh_heuristic_udp)
 -- ──────────────────────────────────────────────────────────────
 -- 14.  Statistics tap
 -- ──────────────────────────────────────────────────────────────
--- Registers a tap that feeds Wireshark's built-in Statistics → Zenoh menu.
--- Each time a Zenoh packet is dissected the tap function increments counters
--- for transport message type, network message type, and total byte volume.
--- View via:  Statistics → Zenoh Protocol Statistics  (tshark: -z zenoh,stat)
+-- Accumulate per-message-type counters updated during dissection (first pass only).
+-- View via tshark: -z zenoh,stat
+-- Wireshark: Statistics → Zenoh Protocol Statistics (when available)
 
 local tap_zenoh = nil
 do
-    local ok, err = pcall(function()
-        tap_zenoh = Listener.new("zenoh")
-    end)
-    if not ok then
-        -- Listener creation can fail if the dissector has not been registered yet
-        -- or if running in a context without tap support; silently skip.
-        tap_zenoh = nil
-    end
+    local ok, _ = pcall(function() tap_zenoh = Listener.new("zenoh") end)
+    if not ok then tap_zenoh = nil end
 end
 
 if tap_zenoh then
-    -- Per-capture accumulators reset on each tap draw.
-    local stat_transport = {}   -- [msg_id_str] = count
-    local stat_network   = {}   -- [msg_id_str] = count
-    local stat_bytes     = 0
-
     tap_zenoh.packet = function(pinfo, tvb)
-        stat_bytes = stat_bytes + tvb:len()
+        if not pinfo.visited then
+            zenoh_stats.bytes = zenoh_stats.bytes + tvb:len()
+        end
     end
 
     tap_zenoh.draw = function()
-        -- Called by Wireshark when statistics are requested.
-        -- Output is only meaningful in tshark (-z zenoh,stat) context.
-        print(string.format("Zenoh Protocol Statistics"))
-        print(string.format("  Total bytes captured : %d", stat_bytes))
+        local function sorted_pairs(t)
+            local keys = {}
+            for k in pairs(t) do keys[#keys+1] = k end
+            table.sort(keys)
+            local i = 0
+            return function()
+                i = i + 1
+                return keys[i], t[keys[i]]
+            end
+        end
+
+        print(string.rep("=", 60))
+        print("Zenoh Protocol Statistics")
+        print(string.rep("=", 60))
+        print(string.format("  Total bytes decoded : %d", zenoh_stats.bytes))
+        print("")
+
+        print("  Transport messages:")
+        for name, cnt in sorted_pairs(zenoh_stats.transport) do
+            print(string.format("    %-20s : %d", name, cnt))
+        end
+
+        print("")
+        print("  Network messages:")
+        for name, cnt in sorted_pairs(zenoh_stats.network) do
+            print(string.format("    %-20s : %d", name, cnt))
+        end
+
+        if next(zenoh_stats.scouting) then
+            print("")
+            print("  Scouting messages:")
+            for name, cnt in sorted_pairs(zenoh_stats.scouting) do
+                print(string.format("    %-20s : %d", name, cnt))
+            end
+        end
+
+        local rt = zenoh_stats.resp_times_ms
+        if #rt > 0 then
+            local sum, mn, mx = 0, rt[1], rt[1]
+            for _, v in ipairs(rt) do
+                sum = sum + v
+                if v < mn then mn = v end
+                if v > mx then mx = v end
+            end
+            print("")
+            print("  Query response times:")
+            print(string.format("    Samples : %d", #rt))
+            print(string.format("    Min     : %.3f ms", mn))
+            print(string.format("    Avg     : %.3f ms", sum / #rt))
+            print(string.format("    Max     : %.3f ms", mx))
+        end
+
+        print(string.rep("=", 60))
     end
 
     tap_zenoh.reset = function()
-        stat_transport = {}
-        stat_network   = {}
-        stat_bytes     = 0
+        zenoh_stats.transport     = {}
+        zenoh_stats.network       = {}
+        zenoh_stats.scouting      = {}
+        zenoh_stats.bytes         = 0
+        zenoh_stats.sessions      = 0
+        zenoh_stats.resp_times_ms = {}
     end
 end
